@@ -1,5 +1,4 @@
 using Microsoft.AspNetCore.Http;
-using Microsoft.Extensions.Caching.Memory;
 using Newtonsoft.Json.Linq;
 using Shared;
 using Shared.Models.Base;
@@ -7,7 +6,6 @@ using Shared.Models.Events;
 using Shared.Models.Module;
 using Shared.Models.Module.Interfaces;
 using Shared.Services;
-using Shared.Services.Hybrid;
 using Shared.Services.Kit;
 using System;
 using System.Collections.Generic;
@@ -19,19 +17,13 @@ public class ModInit : IModuleLoaded, IModuleOnlineAsync
 {
     public static ModuleConf conf;
 
-    public async Task<List<ModuleOnlineItem>> InvokeAsync(HttpContext httpContext, RequestModel requestInfo, string host, OnlineEventsModel args)
+    public Task<List<ModuleOnlineItem>> InvokeAsync(HttpContext httpContext, RequestModel requestInfo, string host, OnlineEventsModel args)
     {
         var online = new List<ModuleOnlineItem>();
-
         var user = requestInfo.user;
-        var memoryCache = HybridCache.GetMemory();
 
         if (args.kinopoisk_id > 0 || (args.source != null && args.source.Equals("vokino", StringComparison.OrdinalIgnoreCase)))
         {
-            string vid = args.kinopoisk_id.ToString();
-            if ((args.source != null && args.source.Equals("vokino", StringComparison.OrdinalIgnoreCase)) && !string.IsNullOrEmpty(args.id))
-                vid = args.id;
-
             var myinit = KitInvoke.Load(conf, args.kitconf, requestInfo, (j, i, c) =>
             {
                 if (j.ContainsKey("online"))
@@ -97,31 +89,16 @@ public class ModInit : IModuleLoaded, IModuleOnlineAsync
                         send("HDVB");
                 }
 
-                ValueTask vkino()
-                {
-                    SendOnline(null);
-                    return ValueTask.CompletedTask;
-                }
+                bool canAccess = CoreInit.conf.accsdb.enable
+                    ? (user != null && !(myinit.group > user.group && myinit.group_hide))
+                    : !(myinit.group > 0 && myinit.group_hide && (user == null || myinit.group > user.group));
 
-                if (CoreInit.conf.accsdb.enable)
-                {
-                    if (user != null)
-                    {
-                        if (myinit.group > user.group && myinit.group_hide) { }
-                        else
-                            await vkino();
-                    }
-                }
-                else
-                {
-                    if (myinit.group > 0 && myinit.group_hide && (user == null || myinit.group > user.group)) { }
-                    else
-                        await vkino();
-                }
+                if (canAccess)
+                    SendOnline(null);
             }
         }
 
-        return online;
+        return Task.FromResult(online);
     }
 
     public void Loaded(InitspaceModel baseconf)
@@ -156,6 +133,7 @@ public class ModInit : IModuleLoaded, IModuleOnlineAsync
             case "vokino-videobase":
             case "vokino-alloha":
             case "vokino-filmix":
+            case "vokino-coconut":
                 return " ~ 2160p";
             case "vokino-vibix":
             case "vokino-monframe":
@@ -163,7 +141,6 @@ public class ModInit : IModuleLoaded, IModuleOnlineAsync
             case "vokino-ashdi":
             case "vokino-zetflix":
             case "vokino-hdvb":
-            case "vokino-coconut":
                 return " ~ 1080p";
             case "vokino-mango":
                 return " ~ 720p";
