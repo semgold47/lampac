@@ -20,17 +20,21 @@ public struct VoKinoInvoke
     string token;
     HttpHydra httpHydra;
     Func<string, string> onstreamfile;
+    Func<string, string> accsArgs;
 
     static readonly Regex SeasonOrEpisodeNum = new(@"\d+", RegexOptions.Compiled);
-    static readonly Regex EpisodeIdent = new(@"\d+$", RegexOptions.Compiled);
+    static readonly Regex EpisodeIdent       = new(@"\d+$", RegexOptions.Compiled);
+    static readonly Regex RxHashParam        = new(@"([?&]h=)([^&]+)", RegexOptions.Compiled);
+    static readonly Regex RxJsonQuality      = new(@"""quality""\s*:\s*\d+", RegexOptions.Compiled);
 
-    public VoKinoInvoke(string host, string apihost, string token, HttpHydra httpHydra, Func<string, string> onstreamfile)
+    public VoKinoInvoke(string host, string apihost, string token, HttpHydra httpHydra, Func<string, string> onstreamfile, Func<string, string> accsArgs = null)
     {
         this.host = host != null ? $"{host}/" : null;
         this.apihost = apihost;
         this.token = token;
         this.httpHydra = httpHydra;
         this.onstreamfile = onstreamfile;
+        this.accsArgs = accsArgs ?? (l => l);
     }
     #endregion
 
@@ -57,8 +61,7 @@ public struct VoKinoInvoke
                     if (item.Value.ValueKind != JsonValueKind.Object || !item.Value.TryGetProperty("playlist_url", out var playlistProp))
                         continue;
 
-                    string playlistUrl = playlistProp.GetString();
-                    if (string.IsNullOrEmpty(playlistUrl))
+                    if (string.IsNullOrEmpty(playlistProp.GetString()))
                         continue;
 
                     var model = new Similar()
@@ -94,7 +97,6 @@ public struct VoKinoInvoke
 
                 RootObject root = null;
 
-                // До 2 попыток с небольшой паузой при сбое 503 / 429 или пустом ответе
                 for (int attempt = 0; attempt < 2; attempt++)
                 {
                     root = await httpHydra.Get<RootObject>(uri, safety: true, textJson: true);
@@ -138,13 +140,7 @@ public struct VoKinoInvoke
             foreach (var similar in result.similars)
             {
                 string link = host + $"lite/vokino?rjson={rjson}&origid={origid}&kinopoisk_id={kinopoisk_id}&title={enc_title}&original_title={enc_original_title}&balancer={similar.balancer}";
-
-                stpl.Append(
-                    similar.title,
-                    string.Empty,
-                    string.Empty,
-                    link
-                );
+                stpl.Append(similar.title, string.Empty, string.Empty, link);
             }
 
             return stpl;
@@ -158,7 +154,7 @@ public struct VoKinoInvoke
         var voices = result.menu?.FirstOrDefault(i => i.title is "Перевод" or "Переводы" or "Озвучка" or "Озвучки")?.submenu;
         var vtpl = new VoiceTpl(voices != null ? voices.Length : 0);
 
-        string voice_s = (result.channels.First().playlist_url is "submenu" or "sumbenu") ? "-1" : s.ToString();
+        string voice_s = s >= 0 ? s.ToString() : "-1";
 
         if (voices != null && voices.Length > 0)
         {
@@ -166,9 +162,9 @@ public struct VoKinoInvoke
             {
                 string _t = string.Empty;
 
-                if (!string.IsNullOrEmpty(translation.playlist_url) && translation.playlist_url.Contains("?"))
+                if (!string.IsNullOrEmpty(translation.playlist_url) && translation.playlist_url.Contains('?'))
                 {
-                    string queryPart = translation.playlist_url.Split("?")[1];
+                    string queryPart = translation.playlist_url.Split('?')[1];
                     _t = HttpUtility.UrlEncode(Convert.ToBase64String(Encoding.UTF8.GetBytes(queryPart)));
                 }
 
@@ -178,6 +174,20 @@ public struct VoKinoInvoke
                     host + $"lite/vokino?rjson={rjson}&origid={origid}&kinopoisk_id={kinopoisk_id}&balancer={balancer}&title={enc_title}&original_title={enc_original_title}&t={_t}&s={voice_s}"
                 );
             }
+        }
+
+        // Доступные качества из menu ("Качество") для Filmix
+        var menuQualities = new List<int>();
+        var qualityMenu = result.menu?.FirstOrDefault(i => i.title == "Качество")?.submenu;
+        if (qualityMenu != null)
+        {
+            foreach (var qItem in qualityMenu)
+            {
+                string mVal = SeasonOrEpisodeNum.Match(qItem.title ?? string.Empty).Value;
+                if (int.TryParse(mVal, out int qInt) && qInt > 0 && !menuQualities.Contains(qInt))
+                    menuQualities.Add(qInt);
+            }
+            menuQualities.Sort((a, b) => b.CompareTo(a));
         }
         #endregion
 
@@ -191,9 +201,7 @@ public struct VoKinoInvoke
                 for (int i = 0; i < result.channels.Length; i++)
                 {
                     var ch = result.channels[i];
-                    string chTitle = ch.title ?? string.Empty;
-
-                    string sname = SeasonOrEpisodeNum.Match(chTitle).Value;
+                    string sname = SeasonOrEpisodeNum.Match(ch.title ?? string.Empty).Value;
                     if (string.IsNullOrEmpty(sname))
                         sname = (i + 1).ToString();
 
@@ -227,28 +235,35 @@ public struct VoKinoInvoke
                     if (string.IsNullOrEmpty(epNum))
                         epNum = (i + 1).ToString();
 
-                    string playUrl = null;
-
                     if (!string.IsNullOrEmpty(e.stream_url))
                     {
-                        playUrl = onstreamfile(e.stream_url);
+                        var epQuality = BuildFilmixStreamQualities(e.stream_url, menuQualities);
+                        string playUrl = epQuality != null ? epQuality.Firts().link : onstreamfile(e.stream_url);
+
+                        etpl.Append(
+                            e.title,
+                            title ?? original_title,
+                            s,
+                            epNum,
+                            playUrl,
+                            streamquality: epQuality,
+                            vast: vast
+                        );
                     }
                     else if (!string.IsNullOrEmpty(e.data_url))
                     {
-                        playUrl = host + $"lite/vokino/stream?url={HttpUtility.UrlEncode(e.data_url)}";
+                        string callUrl = host + $"lite/vokino/stream?balancer={HttpUtility.UrlEncode(balancer)}&title={enc_title}&url={HttpUtility.UrlEncode(e.data_url)}";
+                        etpl.Append(
+                            e.title,
+                            title ?? original_title,
+                            s,
+                            epNum,
+                            accsArgs(callUrl),
+                            "call",
+                            streamlink: accsArgs($"{callUrl}&play=true"),
+                            vast: vast
+                        );
                     }
-
-                    if (string.IsNullOrEmpty(playUrl))
-                        continue;
-
-                    etpl.Append(
-                        e.title,
-                        title ?? original_title,
-                        s,
-                        epNum,
-                        playUrl,
-                        vast: vast
-                    );
                 }
 
                 return etpl;
@@ -260,13 +275,6 @@ public struct VoKinoInvoke
 
             foreach (var ch in result.channels)
             {
-                string streamUrl = ch.stream_url;
-                if (string.IsNullOrEmpty(streamUrl) && !string.IsNullOrEmpty(ch.data_url))
-                    streamUrl = host + $"lite/vokino/stream?url={HttpUtility.UrlEncode(ch.data_url)}";
-
-                if (string.IsNullOrEmpty(streamUrl))
-                    continue;
-
                 string name = !string.IsNullOrWhiteSpace(ch.title) ? ch.title : (ch.quality_full ?? "AUTO");
                 name = name.Replace("2160p.", "4K ");
 
@@ -276,14 +284,65 @@ public struct VoKinoInvoke
                 if (ch.extra != null && ch.extra.TryGetValue("size", out string size) && !string.IsNullOrEmpty(size))
                     name += $" - {size}";
 
-                mtpl.Append(
-                    name,
-                    onstreamfile(streamUrl),
-                    vast: vast
-                );
+                if (!string.IsNullOrEmpty(ch.stream_url))
+                {
+                    var movieQuality = BuildFilmixStreamQualities(ch.stream_url, menuQualities);
+                    string playUrl = movieQuality != null ? movieQuality.Firts().link : onstreamfile(ch.stream_url);
+
+                    mtpl.Append(
+                        name,
+                        playUrl,
+                        streamquality: movieQuality,
+                        vast: vast
+                    );
+                }
+                else if (!string.IsNullOrEmpty(ch.data_url))
+                {
+                    string callUrl = host + $"lite/vokino/stream?balancer={HttpUtility.UrlEncode(balancer)}&title={enc_title}&url={HttpUtility.UrlEncode(ch.data_url)}";
+                    mtpl.Append(
+                        name,
+                        accsArgs(callUrl),
+                        "call",
+                        stream: accsArgs($"{callUrl}&play=true"),
+                        vast: vast
+                    );
+                }
             }
 
             return mtpl;
+        }
+    }
+
+    StreamQualityTpl BuildFilmixStreamQualities(string streamUrl, List<int> qualities)
+    {
+        if (qualities == null || qualities.Count == 0 || string.IsNullOrEmpty(streamUrl))
+            return null;
+
+        var m = RxHashParam.Match(streamUrl);
+        if (!m.Success)
+            return null;
+
+        try
+        {
+            string rawB64 = HttpUtility.UrlDecode(m.Groups[2].Value).Replace(" ", "+");
+            string decodedJson = Encoding.UTF8.GetString(Convert.FromBase64String(rawB64));
+            if (!RxJsonQuality.IsMatch(decodedJson))
+                return null;
+
+            var list = new List<StreamQualityDto>(qualities.Count);
+            foreach (int q in qualities)
+            {
+                string newJson = RxJsonQuality.Replace(decodedJson, $"\"quality\":{q}");
+                string newB64 = HttpUtility.UrlEncode(Convert.ToBase64String(Encoding.UTF8.GetBytes(newJson)));
+                string newUrl = streamUrl.Substring(0, m.Groups[2].Index) + newB64 + streamUrl.Substring(m.Groups[2].Index + m.Groups[2].Length);
+                list.Add(new StreamQualityDto(onstreamfile(newUrl), $"{q}p"));
+            }
+
+            return new StreamQualityTpl(list);
+        }
+        catch
+        {
+            return null;
         }
     }
     #endregion
